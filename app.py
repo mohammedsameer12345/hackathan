@@ -9,18 +9,31 @@ from datetime import datetime
 import requests
 from io import BytesIO
 import base64
-from perplexity_api import PerplexityAPI
+from groq_api import GroqAPI
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your-secret-key-here'
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
+from fastapi import HTTPException, status, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+TEAM_BEARER_TOKEN = os.getenv("TEAM_BEARER_TOKEN")
+security = HTTPBearer()
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if credentials.scheme.lower() != "bearer" or credentials.credentials != TEAM_BEARER_TOKEN:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Invalid or missing authorization token")
+    return True
+
 # Ensure upload directory exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Initialize Perplexity API client
-perplexity_client = PerplexityAPI()
+# Initialize Groq API client
+groq_client = GroqAPI()
+
 
 # Allowed file extensions
 ALLOWED_EXTENSIONS = {'pdf', 'docx', 'txt', 'doc'}
@@ -165,8 +178,8 @@ def process_query():
     if not document_text:
         return jsonify({'error': 'No document text provided'}), 400
     
-    # Process the query using the Perplexity API
-    result = perplexity_client.query_document(query, document_text, query_type)
+    # Process the query using the Groq API
+    result = groq_client.query_document(query, document_text, query_type)
     
     return jsonify(result)
 

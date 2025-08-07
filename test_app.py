@@ -103,7 +103,7 @@ def test_perplexity_api():
     """Test the Perplexity API integration"""
     print("Testing Perplexity API integration...")
     try:
-        from perplexity_api import PerplexityAPI
+        from OpenAI import PerplexityAPI
         
         api_client = PerplexityAPI()
         result = api_client.query_document(
