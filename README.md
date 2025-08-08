@@ -55,7 +55,7 @@ pip install -r requirements.txt
 ### 3. Set Up Environment Variables (Optional)
 Create a `.env` file in the root directory:
 ```env
-PERPLEXITY_API_KEY=your_perplexity_api_key_here
+PERPLEXITY_API_KEY=your_groq_key_here
 FLASK_SECRET_KEY=your_secret_key_here
 ```
 
