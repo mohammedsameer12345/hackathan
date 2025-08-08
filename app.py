@@ -1,4 +1,5 @@
 from fileinput import filename
+from typing import Dict, List
 from flask import Flask, render_template, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 import os
@@ -105,7 +106,19 @@ def analyze_document_content(document_text):
     text_lower = document_text.lower()
     
     document_type = "General Document"
-    if any(keyword in text_lower for keyword in ['insurance', 'policy', 'coverage', 'premium']):
+    
+    # Enhanced insurance policy detection with more keywords
+    insurance_keywords = [
+        'insurance', 'policy', 'coverage', 'premium', 'sum insured', 'policy period',
+        'policyholder', 'insured', 'claim', 'exclusion', 'waiting period', 'grace period',
+        'cumulative bonus', 'portability', 'renewal', 'deductible', 'co-payment'
+    ]
+    
+    # Count how many insurance keywords appear in the document
+    insurance_keyword_count = sum(1 for keyword in insurance_keywords if keyword in text_lower)
+    
+    # If we have at least 3 insurance keywords, classify as insurance policy
+    if insurance_keyword_count >= 3:
         document_type = "Insurance Policy"
     elif any(keyword in text_lower for keyword in ['contract', 'agreement', 'terms', 'conditions']):
         document_type = "Legal Contract"
@@ -170,8 +183,16 @@ def retrieve_relevant_chunks(query, filename, max_tokens=1500, top_k=3):
     index = faiss.read_index(vector_db_path)
     with open(chunks_path, 'rb') as f:
         chunks = pickle.load(f)
+        
+    # Check if index has any vectors
+    if index.ntotal == 0:
+        logger.error(f"FAISS index is empty for {filename}")
+        return []
+        
+    # Encode query and reshape to 2D array
+    query_embedding = embedding_model.encode(query, convert_to_tensor=False).astype('float32')
+    query_embedding = query_embedding.reshape(1, -1)  # Reshape to (1, embedding_dim)
     
-    query_embedding = embedding_model.encode([query], convert_to_tensor=False).astype('float32')
     distances, indices = index.search(query_embedding, top_k)
     
     relevant_chunks = []
@@ -215,19 +236,109 @@ def retry_with_backoff(func, max_retries=3, base_delay=1):
         raise Exception("Max retries reached")
     return wrapper
 
-def try_structured_extraction(query, analysis, document_type):
+def try_structured_extraction(query, analysis, document_type, query_type):
     """Attempt to answer query using structured extraction from DocumentAnalyzer."""
-    logger.debug(f"Attempting structured extraction for query: {query}, document_type: {document_type}")
+    logger.debug(f"Attempting structured extraction for query: {query}, document_type: {document_type}, query_type: {query_type}")
+    
     if document_type == "Insurance Policy":
-        if any(keyword in query.lower() for keyword in ["duration", "period", "term"]):
-            key_terms = analysis.get("key_terms", [])
+        query_lower = query.lower()
+        
+        # Duration queries - only check relevant sections
+        if query_type == "duration" or any(keyword in query_lower for keyword in ["duration", "period", "term", "policy term", "policy period", "length", "how long"]):
+            # Define duration pattern to look for actual time periods
+            duration_pattern = r'(\d+)\s*(year|years|month|months|day|days)'
+            
+            # Only check sections that are likely to contain duration information
+            duration_sections = [
+                ("key_terms", analysis.get("key_terms", [])),
+                ("terms_conditions", analysis.get("terms_conditions", [])),
+                ("definitions", analysis.get("definitions", []))
+            ]
+            
+            for section_name, section_content in duration_sections:
+                for term in section_content:
+                    term_lower = term.lower()
+                    # Check if the term contains duration keywords AND has a duration pattern
+                    if any(keyword in term_lower for keyword in ["duration", "period", "term", "policy term", "policy period"]):
+                        # Look for actual duration values
+                        match = re.search(duration_pattern, term_lower)
+                        if match:
+                            logger.debug(f"Found duration with pattern in {section_name}: {term}")
+                            return {"answer": term, "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}
+            
+            # If no term with duration pattern found, try to find any term that has the keyword
+            for section_name, section_content in duration_sections:
+                for term in section_content:
+                    term_lower = term.lower()
+                    if any(keyword in term_lower for keyword in ["duration", "period", "term", "policy term", "policy period"]):
+                        logger.debug(f"Found duration keyword in {section_name} (without pattern): {term}")
+                        return {"answer": term, "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}
+        
+        # Coverage queries - only check coverage section
+        elif query_type == "coverage" or any(keyword in query_lower for keyword in ["coverage", "covered", "protection", "benefits"]):
+            coverage_details = analysis.get("coverage_details", [])
+            if coverage_details:
+                # Look for terms that actually mention coverage
+                for detail in coverage_details:
+                    detail_lower = detail.lower()
+                    if any(keyword in detail_lower for keyword in ["coverage", "covered", "benefits", "included"]):
+                        logger.debug(f"Found relevant coverage detail: {detail}")
+                        return {"answer": detail, "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}
+        
+        # Exclusion queries - only check exclusions section
+        elif query_type == "exclusions" or any(keyword in query_lower for keyword in ["exclusion", "excluded", "not covered"]):
+            exclusions = analysis.get("exclusions", [])
+            if exclusions:
+                # Look for terms that actually mention exclusions
+                for exclusion in exclusions:
+                    exclusion_lower = exclusion.lower()
+                    if any(keyword in exclusion_lower for keyword in ["exclusion", "excluded", "not covered", "limitation"]):
+                        logger.debug(f"Found relevant exclusion: {exclusion}")
+                        return {"answer": exclusion, "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}
+        
+        # Claims process queries - only check claims section
+        elif query_type == "claims" or any(keyword in query_lower for keyword in ["claim", "file a claim", "claims process", "how to claim"]):
+            claims_process = analysis.get("claims_process", [])
+            if claims_process:
+                # Look for terms that actually mention claims
+                for claim in claims_process:
+                    claim_lower = claim.lower()
+                    if any(keyword in claim_lower for keyword in ["claim", "claims", "file", "process", "procedure"]):
+                        logger.debug(f"Found relevant claims process: {claim}")
+                        return {"answer": claim, "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}
+        
+        # Premium queries - only check premium section
+        elif query_type == "premium" or any(keyword in query_lower for keyword in ["premium", "cost", "price", "payment", "fee"]):
+            premium_info = analysis.get("premium_info", [])
+            if premium_info:
+                # Look for terms that actually mention premium
+                premium_lower = premium_info.lower()
+                if any(keyword in premium_lower for keyword in ["premium", "cost", "price", "payment", "fee"]):
+                    logger.debug(f"Found relevant premium info: {premium_info}")
+                    return {"answer": premium_info, "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}
+        
+        # Terms & Conditions queries - only check terms section
+        elif query_type == "terms" or any(keyword in query_lower for keyword in ["terms", "conditions", "terms and conditions"]):
             terms_conditions = analysis.get("terms_conditions", [])
+            if terms_conditions:
+                # Look for terms that actually mention terms and conditions
+                for term in terms_conditions:
+                    term_lower = term.lower()
+                    if any(keyword in term_lower for keyword in ["terms", "conditions", "provision", "clause"]):
+                        logger.debug(f"Found relevant terms and conditions: {term}")
+                        return {"answer": term, "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}
+        
+        # Definitions queries - only check definitions section
+        elif query_type == "definitions" or any(keyword in query_lower for keyword in ["definition", "define", "meaning"]):
             definitions = analysis.get("definitions", [])
-            logger.debug(f"Key terms: {key_terms}, Terms conditions: {terms_conditions}, Definitions: {definitions}")
-            for term in key_terms + terms_conditions + definitions:
-                if any(keyword in term.lower() for keyword in ["period", "duration", "term", "policy period"]):
-                    logger.debug(f"Found structured answer: {term}")
-                    return {"answer": term, "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}
+            if definitions:
+                # Look for terms that actually contain definitions
+                for definition in definitions:
+                    definition_lower = definition.lower()
+                    if any(keyword in definition_lower for keyword in ["definition", "defined as", "means", "refers to"]):
+                        logger.debug(f"Found relevant definition: {definition}")
+                        return {"answer": definition, "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}
+    
     logger.debug("No structured answer found, falling back to RAG")
     return None
 
@@ -255,10 +366,20 @@ def upload_file():
         chunks = split_document(document_text)
         vector_db_path, chunks_path = create_vector_index(chunks, filename)
         
+        # Get detailed analysis from document_analyzer
         detailed_analysis = document_analyzer.analyze_document(document_text)
+        
+        # Get simple analysis with improved document type detection
         simple_analysis = analyze_document_content(document_text)
         
+        # If detailed analysis classified as Resume/CV but simple analysis says Insurance Policy,
+        # override the document type in detailed_analysis
+        if detailed_analysis.get('document_type') == 'Resume/CV' and simple_analysis.get('document_type') == 'Insurance Policy':
+            detailed_analysis['document_type'] = 'Insurance Policy'
+            logger.debug("Overrode document type from Resume/CV to Insurance Policy")
+        
         logger.debug(f"Detailed analysis: {detailed_analysis}")
+        logger.debug(f"Simple analysis: {simple_analysis}")
         
         document_info = {
             'filename': filename,
@@ -296,12 +417,14 @@ def process_query():
     if not document_text or not filename:
         return jsonify({'error': 'No document text or filename provided'}), 400
     
-    if detailed_analysis.get('document_type') == "Insurance Policy":
-        result = try_structured_extraction(query, detailed_analysis, "Insurance Policy")
-        if result:
-            logger.debug(f"Structured extraction succeeded for query: {query}")
-            return jsonify(result)
+    # Try structured extraction first
+    document_type = detailed_analysis.get('document_type', 'General Document')
+    result = try_structured_extraction(query, detailed_analysis, document_type, query_type)
+    if result:
+        logger.debug(f"Structured extraction succeeded for query: {query}")
+        return jsonify(result)
     
+    # Fall back to RAG if structured extraction fails
     relevant_chunks = retrieve_relevant_chunks(query, filename, max_tokens=1500, top_k=3)
     context = "\n".join(relevant_chunks)
     result = groq_client.query_document(query, context, query_type)
@@ -320,6 +443,12 @@ def analyze_document():
     simple_analysis = analyze_document_content(document_text)
     detailed_analysis = document_analyzer.analyze_document(document_text)
     
+    # If detailed analysis classified as Resume/CV but simple analysis says Insurance Policy,
+    # override the document type in detailed_analysis
+    if detailed_analysis.get('document_type') == 'Resume/CV' and simple_analysis.get('document_type') == 'Insurance Policy':
+        detailed_analysis['document_type'] = 'Insurance Policy'
+        logger.debug("Overrode document type from Resume/CV to Insurance Policy")
+    
     return jsonify({
         'simple_analysis': simple_analysis,
         'detailed_analysis': detailed_analysis
@@ -335,47 +464,55 @@ def hackrx_run():
     token = auth_header.split(" ")[1]
     if token != TEAM_BEARER_TOKEN:
         return jsonify({"error": "Unauthorized"}), 401
-
+    
     data = request.get_json()
     document_url = data.get("documents")
     questions = data.get("questions", [])
-
+    
     if not document_url or not questions:
         return jsonify({"error": "Missing documents or questions"}), 400
-
+    
     try:
         response = requests.get(document_url)
         if response.status_code != 200:
             return jsonify({"error": "Unable to fetch document"}), 400
-
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{timestamp}_temp_doc.pdf"
         temp_filename = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         with open(temp_filename, 'wb') as f:
             f.write(response.content)
-
+        
         document_text = extract_text_from_pdf(temp_filename)
         chunks = split_document(document_text)
         create_vector_index(chunks, filename)
         
         detailed_analysis = document_analyzer.analyze_document(document_text)
         
+        # If detailed analysis classified as Resume/CV but simple analysis says Insurance Policy,
+        # override the document type in detailed_analysis
+        simple_analysis = analyze_document_content(document_text)
+        if detailed_analysis.get('document_type') == 'Resume/CV' and simple_analysis.get('document_type') == 'Insurance Policy':
+            detailed_analysis['document_type'] = 'Insurance Policy'
+            logger.debug("Overrode document type from Resume/CV to Insurance Policy")
+        
         answers = []
         for question in questions:
-            if detailed_analysis.get('document_type') == "Insurance Policy":
-                result = try_structured_extraction(question, detailed_analysis, "Insurance Policy")
-                if result:
-                    answers.append(result["answer"])
-                    continue
+            # Try structured extraction first
+            document_type = detailed_analysis.get('document_type', 'General Document')
+            result = try_structured_extraction(question, detailed_analysis, document_type, "hackathon")
+            if result:
+                answers.append(result["answer"])
+                continue
             
+            # Fall back to RAG if structured extraction fails
             relevant_chunks = retrieve_relevant_chunks(question, filename, max_tokens=1500, top_k=3)
             context = "\n".join(relevant_chunks)
             result = groq_client.query_document(question, context, query_type="hackathon")
             answer = result.get("answer", "No answer returned")
             answers.append(answer)
-
+        
         return jsonify({"answers": answers})
-
     except Exception as e:
         return jsonify({"error": f"Something went wrong: {str(e)}"}), 500
 
