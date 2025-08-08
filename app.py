@@ -26,6 +26,7 @@ import pickle
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'b97176f45315f8b8619a91bcd13888339bfe7f7993767f98764cf5e21fc9192f'
 app.config['UPLOAD_FOLDER'] = 'Uploads'
@@ -515,6 +516,10 @@ def hackrx_run():
         return jsonify({"answers": answers})
     except Exception as e:
         return jsonify({"error": f"Something went wrong: {str(e)}"}), 500
+    
+    
+# Add Flask route for /api/vl/hackrx/run POST endpoint
+app.route("/api/vl/hackrx/run", methods=["POST"])(hackrx_run)
 
 @app.route('/download/<filename>')
 def download_file():
@@ -531,6 +536,10 @@ def health_check():
         'timestamp': datetime.now().isoformat(),
         'version': '1.0.0'
     })
+
+
+# Register additional route for hackrx_run at /api/vl/hackrx/run
+app.route("/api/vl/hackrx/run", methods=["POST"])(hackrx_run)
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
