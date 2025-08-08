@@ -11,23 +11,23 @@ class GroqAPI:
             base_url="https://api.groq.com/openai/v1"
         )
 
-    def query_document(self, query, document_text, query_type="general"):
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant that analyzes documents and answers user queries."},
-            {"role": "user", "content": f"Query type: {query_type}\n\nQuery: {query}\n\nDocument:\n{document_text}"}
-        ]
+    def query_document(self, query, context, query_type="general"):
+        prompt = f"Context:\n{context}\n\nQuestion:\n{query}"
         try:
             response = self.client.chat.completions.create(
                 model="llama3-70b-8192",
-                messages=messages,
-                temperature=0.7
+                messages=[
+                    {"role": "system", "content": "You're a helpful assistant answering document-based questions."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3
             )
-            return {
-                "response": response.choices[0].message.content.strip(),
-                "success": True
+            answer = response.choices[0].message.content.strip()
+            token_usage = {
+                "input_tokens": response.usage.prompt_tokens,
+                "output_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens
             }
+            return {"answer": answer, "token_usage": token_usage}
         except Exception as e:
-            return {
-                "response": str(e),
-                "success": False
-            }
+            raise Exception(f"Groq API error: {str(e)}")

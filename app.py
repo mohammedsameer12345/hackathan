@@ -1,3 +1,4 @@
+from fileinput import filename
 from flask import Flask, render_template, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 import os
@@ -10,36 +11,50 @@ import requests
 from io import BytesIO
 import base64
 from groq_api import GroqAPI
+import time
+import math
+from functools import wraps
+from document_analyzer import DocumentAnalyzer
+import logging
+import numpy as np
+from sentence_transformers import SentenceTransformer, util
+import faiss
+import pickle
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key-here'
-app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['SECRET_KEY'] = 'b97176f45315f8b8619a91bcd13888339bfe7f7993767f98764cf5e21fc9192f'
+app.config['UPLOAD_FOLDER'] = 'Uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['VECTOR_DB_PATH'] = os.path.join(app.config['UPLOAD_FOLDER'], 'vector_db')
 
-from fastapi import HTTPException, status, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
-TEAM_BEARER_TOKEN = os.getenv("TEAM_BEARER_TOKEN")
-security = HTTPBearer()
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if credentials.scheme.lower() != "bearer" or credentials.credentials != TEAM_BEARER_TOKEN:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                            detail="Invalid or missing authorization token")
-    return True
-
-# Ensure upload directory exists
+# Ensure upload and vector DB directories exist
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['VECTOR_DB_PATH'], exist_ok=True)
 
-# Initialize Groq API client
+# Load TEAM_BEARER_TOKEN from environment
+TEAM_BEARER_TOKEN = os.getenv("TEAM_BEARER_TOKEN")
+if not TEAM_BEARER_TOKEN:
+    logger.error("TEAM_BEARER_TOKEN not set in environment")
+    raise ValueError("TEAM_BEARER_TOKEN environment variable is required")
+
+# Initialize Groq API client, DocumentAnalyzer, and embedding model
 groq_client = GroqAPI()
-
+document_analyzer = DocumentAnalyzer()
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # Allowed file extensions
 ALLOWED_EXTENSIONS = {'pdf', 'docx', 'txt', 'doc'}
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def estimate_tokens(text):
+    """Estimate token count (approximate: 1 token ~ 4 chars in English text)"""
+    return len(text) // 4
 
 def extract_text_from_pdf(file_path):
     """Extract text from PDF file"""
@@ -89,7 +104,6 @@ def analyze_document_content(document_text):
     """Analyze document content to determine type and extract key information"""
     text_lower = document_text.lower()
     
-    # Determine document type based on content
     document_type = "General Document"
     if any(keyword in text_lower for keyword in ['insurance', 'policy', 'coverage', 'premium']):
         document_type = "Insurance Policy"
@@ -100,7 +114,6 @@ def analyze_document_content(document_text):
     elif any(keyword in text_lower for keyword in ['compliance', 'regulation', 'regulatory', 'legal']):
         document_type = "Compliance Document"
     
-    # Extract key sections (simplified approach)
     key_sections = []
     if 'coverage' in text_lower:
         key_sections.append('Coverage Details')
@@ -120,6 +133,103 @@ def analyze_document_content(document_text):
         'estimated_pages': len(document_text) // 500,
         'summary': "This appears to be a " + document_type.lower() + " containing " + str(len(key_sections)) + " main sections."
     }
+
+def split_document(text, chunk_size=300):
+    """Split the document into chunks of specified size."""
+    words = text.split()
+    chunks = [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+    return chunks
+
+def create_vector_index(chunks, filename):
+    """Create and save FAISS index for document chunks."""
+    embeddings = embedding_model.encode(chunks, convert_to_tensor=False)
+    embeddings = np.array(embeddings, dtype='float32')
+    
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(embeddings)
+    
+    vector_db_path = os.path.join(app.config['VECTOR_DB_PATH'], f"{filename}.faiss")
+    chunks_path = os.path.join(app.config['VECTOR_DB_PATH'], f"{filename}_chunks.pkl")
+    faiss.write_index(index, vector_db_path)
+    with open(chunks_path, 'wb') as f:
+        pickle.dump(chunks, f)
+    
+    logger.debug(f"Created FAISS index for {filename}, {len(chunks)} chunks")
+    return vector_db_path, chunks_path
+
+def retrieve_relevant_chunks(query, filename, max_tokens=1500, top_k=3):
+    """Retrieve top-k relevant chunks from FAISS index."""
+    vector_db_path = os.path.join(app.config['VECTOR_DB_PATH'], f"{filename}.faiss")
+    chunks_path = os.path.join(app.config['VECTOR_DB_PATH'], f"{filename}_chunks.pkl")
+    
+    if not os.path.exists(vector_db_path) or not os.path.exists(chunks_path):
+        logger.error(f"Vector DB or chunks not found for {filename}")
+        return []
+    
+    index = faiss.read_index(vector_db_path)
+    with open(chunks_path, 'rb') as f:
+        chunks = pickle.load(f)
+    
+    query_embedding = embedding_model.encode([query], convert_to_tensor=False).astype('float32')
+    distances, indices = index.search(query_embedding, top_k)
+    
+    relevant_chunks = []
+    total_tokens = 0
+    for idx in indices[0]:
+        if idx < len(chunks):
+            chunk = chunks[idx]
+            chunk_tokens = estimate_tokens(chunk)
+            if total_tokens + chunk_tokens <= max_tokens:
+                relevant_chunks.append(chunk)
+                total_tokens += chunk_tokens
+            else:
+                remaining_tokens = max_tokens - total_tokens
+                chars_to_keep = remaining_tokens * 4
+                truncated_chunk = chunk[:chars_to_keep]
+                if truncated_chunk:
+                    relevant_chunks.append(truncated_chunk)
+                break
+    
+    logger.debug(f"Retrieved {len(relevant_chunks)} chunks for query '{query}', total tokens: {total_tokens}, distances: {distances[0].tolist()}")
+    return relevant_chunks
+
+def retry_with_backoff(func, max_retries=3, base_delay=1):
+    """Retry a function with exponential backoff."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                if 'rate_limit_exceeded' in str(e) and attempt < max_retries - 1:
+                    retry_time = 10
+                    match = re.search(r'Please try again in ([\d.]+)s', str(e))
+                    if match:
+                        retry_time = float(match.group(1))
+                    delay = base_delay * (2 ** attempt) + retry_time
+                    logger.debug(f"Rate limit hit, retrying after {delay}s")
+                    time.sleep(delay)
+                    continue
+                raise e
+        raise Exception("Max retries reached")
+    return wrapper
+
+def try_structured_extraction(query, analysis, document_type):
+    """Attempt to answer query using structured extraction from DocumentAnalyzer."""
+    logger.debug(f"Attempting structured extraction for query: {query}, document_type: {document_type}")
+    if document_type == "Insurance Policy":
+        if any(keyword in query.lower() for keyword in ["duration", "period", "term"]):
+            key_terms = analysis.get("key_terms", [])
+            terms_conditions = analysis.get("terms_conditions", [])
+            definitions = analysis.get("definitions", [])
+            logger.debug(f"Key terms: {key_terms}, Terms conditions: {terms_conditions}, Definitions: {definitions}")
+            for term in key_terms + terms_conditions + definitions:
+                if any(keyword in term.lower() for keyword in ["period", "duration", "term", "policy period"]):
+                    logger.debug(f"Found structured answer: {term}")
+                    return {"answer": term, "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}
+    logger.debug("No structured answer found, falling back to RAG")
+    return None
 
 @app.route('/')
 def index():
@@ -141,20 +251,25 @@ def upload_file():
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(file_path)
         
-        # Process the document
         document_text = process_document(file_path)
+        chunks = split_document(document_text)
+        vector_db_path, chunks_path = create_vector_index(chunks, filename)
         
-        # Analyze document content
-        analysis = analyze_document_content(document_text)
+        detailed_analysis = document_analyzer.analyze_document(document_text)
+        simple_analysis = analyze_document_content(document_text)
         
-        # Store document info
+        logger.debug(f"Detailed analysis: {detailed_analysis}")
+        
         document_info = {
             'filename': filename,
             'original_name': file.filename,
             'text': document_text,
             'upload_time': datetime.now().isoformat(),
             'file_size': os.path.getsize(file_path),
-            'analysis': analysis
+            'analysis': simple_analysis,
+            'detailed_analysis': detailed_analysis,
+            'vector_db_path': vector_db_path,
+            'chunks_path': chunks_path
         }
         
         return jsonify({
@@ -166,21 +281,32 @@ def upload_file():
     return jsonify({'error': 'Invalid file type'}), 400
 
 @app.route('/query', methods=['POST'])
+@retry_with_backoff
 def process_query():
     data = request.get_json()
     query = data.get('query', '')
     document_text = data.get('document_text', '')
     query_type = data.get('query_type', 'general')
+    detailed_analysis = data.get('detailed_analysis', {})
+    filename = data.get('filename', '')
     
     if not query:
         return jsonify({'error': 'No query provided'}), 400
     
-    if not document_text:
-        return jsonify({'error': 'No document text provided'}), 400
+    if not document_text or not filename:
+        return jsonify({'error': 'No document text or filename provided'}), 400
     
-    # Process the query using the Groq API
-    result = groq_client.query_document(query, document_text, query_type)
+    if detailed_analysis.get('document_type') == "Insurance Policy":
+        result = try_structured_extraction(query, detailed_analysis, "Insurance Policy")
+        if result:
+            logger.debug(f"Structured extraction succeeded for query: {query}")
+            return jsonify(result)
     
+    relevant_chunks = retrieve_relevant_chunks(query, filename, max_tokens=1500, top_k=3)
+    context = "\n".join(relevant_chunks)
+    result = groq_client.query_document(query, context, query_type)
+    
+    logger.debug(f"RAG pipeline used, tokens: {result['token_usage']['total_tokens']}")
     return jsonify(result)
 
 @app.route('/analyze', methods=['POST'])
@@ -191,13 +317,70 @@ def analyze_document():
     if not document_text:
         return jsonify({'error': 'No document text provided'}), 400
     
-    # Analyze document structure and extract key information
-    analysis = analyze_document_content(document_text)
+    simple_analysis = analyze_document_content(document_text)
+    detailed_analysis = document_analyzer.analyze_document(document_text)
     
-    return jsonify(analysis)
+    return jsonify({
+        'simple_analysis': simple_analysis,
+        'detailed_analysis': detailed_analysis
+    })
+
+@app.route('/hackrx/run', methods=['POST'])
+@retry_with_backoff
+def hackrx_run():
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid authorization header"}), 401
+    
+    token = auth_header.split(" ")[1]
+    if token != TEAM_BEARER_TOKEN:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json()
+    document_url = data.get("documents")
+    questions = data.get("questions", [])
+
+    if not document_url or not questions:
+        return jsonify({"error": "Missing documents or questions"}), 400
+
+    try:
+        response = requests.get(document_url)
+        if response.status_code != 200:
+            return jsonify({"error": "Unable to fetch document"}), 400
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}_temp_doc.pdf"
+        temp_filename = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        with open(temp_filename, 'wb') as f:
+            f.write(response.content)
+
+        document_text = extract_text_from_pdf(temp_filename)
+        chunks = split_document(document_text)
+        create_vector_index(chunks, filename)
+        
+        detailed_analysis = document_analyzer.analyze_document(document_text)
+        
+        answers = []
+        for question in questions:
+            if detailed_analysis.get('document_type') == "Insurance Policy":
+                result = try_structured_extraction(question, detailed_analysis, "Insurance Policy")
+                if result:
+                    answers.append(result["answer"])
+                    continue
+            
+            relevant_chunks = retrieve_relevant_chunks(question, filename, max_tokens=1500, top_k=3)
+            context = "\n".join(relevant_chunks)
+            result = groq_client.query_document(question, context, query_type="hackathon")
+            answer = result.get("answer", "No answer returned")
+            answers.append(answer)
+
+        return jsonify({"answers": answers})
+
+    except Exception as e:
+        return jsonify({"error": f"Something went wrong: {str(e)}"}), 500
 
 @app.route('/download/<filename>')
-def download_file(filename):
+def download_file():
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     if os.path.exists(file_path):
         return send_file(file_path, as_attachment=True)
@@ -213,4 +396,4 @@ def health_check():
     })
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000) 
+    app.run(debug=True, host='0.0.0.0', port=5000)
